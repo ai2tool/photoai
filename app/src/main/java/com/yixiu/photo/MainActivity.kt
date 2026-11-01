@@ -2,6 +2,7 @@ package com.yixiu.photo
 
 import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -12,7 +13,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.FileProvider
@@ -31,15 +32,18 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        when (intent?.action) {
-            android.content.Intent.ACTION_SEND, android.content.Intent.ACTION_EDIT -> {
-                @Suppress("DEPRECATION")
-                val uri = if (android.os.Build.VERSION.SDK_INT >= 33) {
-                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, Uri::class.java)
-                } else {
-                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+        // 只在全新启动时处理外部分享；Activity 被系统重建时 intent 还在，重复打开会把编辑状态清掉
+        if (savedInstanceState == null) {
+            when (intent?.action) {
+                android.content.Intent.ACTION_SEND, android.content.Intent.ACTION_EDIT -> {
+                    @Suppress("DEPRECATION")
+                    val uri = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, Uri::class.java)
+                    } else {
+                        intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+                    }
+                    uri?.let { vm.open(it) }
                 }
-                uri?.let { vm.open(it) }
             }
         }
         setContent {
@@ -58,7 +62,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun AppRoot(vm: EditorViewModel) {
     val context = LocalContext.current
-    var inEditor by remember { mutableStateOf(false) }
+    var inEditor by rememberSaveable { mutableStateOf(false) }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia()
@@ -69,7 +73,8 @@ private fun AppRoot(vm: EditorViewModel) {
         }
     }
 
-    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    // rememberSaveable：拍照/选择期间 Activity 可能被回收重建，URI 必须能活下来
+    var pendingCameraUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     val camera = rememberLauncherForActivityResult(
         ActivityResultContracts.TakePicture()
     ) { ok ->
@@ -79,6 +84,7 @@ private fun AppRoot(vm: EditorViewModel) {
                 inEditor = true
             }
         }
+        pendingCameraUri = null
     }
 
     fun launchPicker() {
@@ -88,11 +94,16 @@ private fun AppRoot(vm: EditorViewModel) {
     }
 
     fun launchCamera() {
-        val dir = File(context.cacheDir, "camera").apply { mkdirs() }
-        val file = File(dir, "cap_${System.currentTimeMillis()}.jpg")
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        pendingCameraUri = uri
-        camera.launch(uri)
+        try {
+            val dir = File(context.cacheDir, "camera").apply { mkdirs() }
+            val file = File(dir, "cap_${System.currentTimeMillis()}.jpg")
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            pendingCameraUri = uri
+            camera.launch(uri)
+        } catch (t: Throwable) {
+            pendingCameraUri = null
+            Toast.makeText(context, "无法打开相机：${t.message ?: "未知错误"}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     LaunchedEffect(vm.preview) {

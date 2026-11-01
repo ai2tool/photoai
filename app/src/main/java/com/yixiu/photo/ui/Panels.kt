@@ -41,6 +41,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -356,9 +357,10 @@ private fun ColorRow(selected: Int, onPick: (Int) -> Unit) {
 
 @Composable
 private fun FaceSwapPanel(vm: EditorViewModel) {
-    var posterUri by remember { mutableStateOf<Uri?>(null) }
-    var sourceUri by remember { mutableStateOf<Uri?>(null) }
-    var msg by remember { mutableStateOf<String?>(null) }
+    // rememberSaveable：选择器打开期间 Activity 可能被系统回收重建，丢失后表现为“只能选中一张”
+    var posterUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var sourceUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var msg by rememberSaveable { mutableStateOf<String?>(null) }
 
     val posterPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
         uri?.let { posterUri = it; msg = null }
