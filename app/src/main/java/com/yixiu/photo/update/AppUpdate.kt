@@ -17,6 +17,7 @@ import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 /**
  * 应用内更新。版本清单放在仓库 `update/app-version.json`：
@@ -38,8 +39,18 @@ object AppUpdate {
         val sha256: String,
         val notes: String,
         val size: Long,
-        val force: Boolean
-    )
+        val force: Boolean,
+        /** 清单里显式给的备用下载地址（可选），会排在自动展开的镜像前面。 */
+        val mirrors: List<String> = emptyList()
+    ) {
+        /** 这条版本可以尝试的所有下载地址：显式备用地址 → 直连 → 各代理。 */
+        fun candidates(): List<String> {
+            val out = LinkedHashSet<String>()
+            mirrors.filter { it.startsWith("http://") || it.startsWith("https://") }.forEach { out.add(it) }
+            out.addAll(mirrorsOf(url, size))
+            return out.toList().ifEmpty { listOf(url) }
+        }
+    }
 
     /** [info] 为空表示：已是最新、用户已忽略该版本，或清单不存在。 */
     class Check(val info: Info?, val error: String?)
@@ -49,22 +60,32 @@ object AppUpdate {
     fun manifestUrl(): String = BuildConfig.UPDATE_BASE.trim().trimEnd('/') + "/app-version.json"
 
     private const val GH_PATH = "ai2tool/photoai/main/update/app-version.json"
-    private const val GH_PROXY = "https://gh-proxy.com/https://raw.githubusercontent.com/"
+    private const val RAW_PREFIX = "https://raw.githubusercontent.com/"
+    private const val GH_PROXY = "https://gh-proxy.com/" + RAW_PREFIX
 
     /** 默认源在 GitHub，国内直连不稳，同一份文件同时问几个代理，谁快用谁。 */
     private val MIRRORS: List<String> = mirrorsOf(GH_PROXY + GH_PATH)
 
-    private fun mirrorsOf(url: String): List<String> {
-        val prefix = GH_PROXY
-        if (!url.startsWith(prefix)) return listOf(url)
-        val path = url.removePrefix(prefix)
-        return listOf(
-            prefix + path,
-            "https://ghfast.top/https://raw.githubusercontent.com/" + path,
-            "https://cdn.jsdelivr.net/gh/" + path.replaceFirst("/main/", "@main/"),
-            "https://raw.githubusercontent.com/" + path,
-            "https://ghproxy.net/https://raw.githubusercontent.com/" + path
+    /**
+     * 把 GitHub raw 地址展开成「代理 → 直连」的候选列表，非 GitHub 地址原样返回。
+     * [size] 已知大小时用来跳过装不下大文件的线路（jsDelivr 单文件上限约 20MB）。
+     */
+    private fun mirrorsOf(url: String, size: Long = -1L): List<String> {
+        val path = when {
+            url.startsWith(GH_PROXY) -> url.removePrefix(GH_PROXY)
+            url.startsWith(RAW_PREFIX) -> url.removePrefix(RAW_PREFIX)
+            else -> return listOf(url)
+        }
+        val out = mutableListOf(
+            GH_PROXY + path,
+            "https://ghfast.top/" + RAW_PREFIX + path,
+            "https://ghproxy.net/" + RAW_PREFIX + path,
+            RAW_PREFIX + path
         )
+        if (size <= 0 || size <= 20L * 1024 * 1024) {
+            out.add("https://cdn.jsdelivr.net/gh/" + path.replaceFirst("/main/", "@main/"))
+        }
+        return out
     }
 
     private fun manifestCandidates(): List<String> =
@@ -103,6 +124,12 @@ object AppUpdate {
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             return@withContext Check(null, "更新信息里没有下载地址")
         }
+        // 清单可以额外给出备用下载地址（自建镜像 / 临时提速），有就排在自动展开的线路前面
+        val mirrors = o.optJSONArray("mirrors")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optString(i).takeIf { it.startsWith("http://") || it.startsWith("https://") }
+            }
+        } ?: emptyList()
         val info = Info(
             code = code,
             name = o.optString("versionName").ifEmpty { code.toString() },
@@ -110,7 +137,8 @@ object AppUpdate {
             sha256 = o.optString("sha256").lowercase(),
             notes = o.optString("notes"),
             size = o.optLong("size"),
-            force = o.optBoolean("force")
+            force = o.optBoolean("force"),
+            mirrors = mirrors
         )
         if (!info.force && ignoredCode == code) Check(null, null) else Check(info, null)
     }
@@ -171,8 +199,10 @@ object AppUpdate {
 
     /**
      * 下载到缓存目录并校验 sha256，失败抛带可读中文原因的异常。
-     * 断点续传：上次留下的 `.part` 用 Range 请求接着下，先把已有字节哈希进去，校验仍覆盖整个文件；
-     * 镜像忽略 Range 返回 200 时，重新从头下载。
+     *
+     * 线路：清单里显式给的备用地址 + 直连 + 各代理，哪条先连上先用。
+     * 断点续传：上次留下的 `.part` 用 Range 请求接着下；这次下载中某条线路断流，已落盘的字节保留，
+     * 换下一条线路继续 Range；镜像忽略 Range 返回 200 时从头重下（摘要同步重置）。
      */
     suspend fun download(
         context: Context,
@@ -190,73 +220,45 @@ object AppUpdate {
             have = 0
         }
         val digest = MessageDigest.getInstance("SHA-256")
-        if (have > 0) part.inputStream().use { s ->
-            val buf = ByteArray(64 * 1024)
-            while (true) {
-                ensureActive()
-                val n = s.read(buf)
-                if (n < 0) break
-                digest.update(buf, 0, n)
-            }
-        }
+        if (have > 0) part.inputStream().use { hashInto(digest, it) }
 
-        val urls = mirrorsOf(info.url)
+        val urls = info.candidates()
         var lastError: String? = null
-        var response: okhttp3.Response? = null
-        for (u in urls) {
-            val req = Request.Builder().url(u).header("User-Agent", UA)
-                .apply { if (have > 0) header("Range", "bytes=$have-") }
-                .build()
-            val r = runCatching {
-                client.newBuilder()
-                    .readTimeout(30, TimeUnit.SECONDS)
-                    .callTimeout(0, TimeUnit.MILLISECONDS)
-                    .build()
-                    .newCall(req).execute()
-            }.getOrElse { e ->
-                lastError = e.message ?: "连接失败"
-                null
-            } ?: continue
-            if (r.isSuccessful || r.code == 206) {
-                response = r
-                break
-            }
-            lastError = "HTTP ${r.code}"
-            // 416：服务端认为续传位置不合法，丢掉残留重来
-            if (r.code == 416 && have > 0) {
-                r.close()
-                part.delete()
-                return@withContext download(context, info, onProgress)
-            }
-            r.close()
-        }
-        val r = response ?: throw IllegalStateException("下载失败（" + (lastError ?: "所有线路都连不上") + "）")
-
-        r.use { resp ->
-            val body = resp.body ?: throw IllegalStateException("下载失败：没有内容")
-            val resuming = have > 0 && resp.code == 206
-            if (!resuming) {
-                digest.reset()
-                have = 0
-            }
-            val total = body.contentLength().takeIf { it > 0 }?.plus(have) ?: info.size
-            body.byteStream().use { input ->
-                java.io.FileOutputStream(part, resuming).use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    var done = have
-                    onProgress(done, total)
-                    while (true) {
-                        ensureActive()
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        digest.update(buf, 0, n)
-                        done += n
-                        onProgress(done, total)
-                    }
+        var completed = false
+        var round = 0
+        while (!completed && round < 2) { // 一轮走完所有线路还没下完，再来一轮（网络抖动）
+            round++
+            var progressed = false
+            for (u in urls) {
+                ensureActive()
+                val start = part.length()
+                if (info.size > 0 && start >= info.size) {
+                    completed = true
+                    break
                 }
+                when (val r = streamTo(u, part, digest, start, info.size, onProgress)) {
+                    Attempt.Done -> {
+                        completed = true
+                        lastError = null
+                    }
+                    is Attempt.Partial -> {
+                        progressed = true // 断流也算推进，part 里多了一些字节
+                        lastError = r.reason
+                    }
+                    is Attempt.Failed -> lastError = r.reason
+                }
+                if (completed) break
             }
+            if (!progressed && !completed) break // 一条线路都没能推进，别空转
         }
+        if (!completed) {
+            val saved = part.length()
+            throw IllegalStateException(
+                if (saved > 0) "下载中断，已保存 ${saved / 1024 / 1024}MB，下次继续（${lastError ?: "所有线路都不通"}）"
+                else "下载失败（${lastError ?: "所有线路都连不上"}）"
+            )
+        }
+
         val hex = digest.digest().joinToString("") { "%02x".format(it) }
         if (info.sha256.isNotEmpty() && hex != info.sha256) {
             part.delete()
@@ -266,18 +268,98 @@ object AppUpdate {
         file
     }
 
+    private sealed class Attempt {
+        /** 读到文件尾。 */
+        object Done : Attempt()
+        /** 中途断了，已写入的字节留在 .part 里。 */
+        class Partial(val reason: String) : Attempt()
+        /** 这条线路没打通，一个字节都没写。 */
+        class Failed(val reason: String) : Attempt()
+    }
+
+    private fun hashInto(digest: MessageDigest, input: java.io.InputStream) {
+        val buf = ByteArray(64 * 1024)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            digest.update(buf, 0, n)
+        }
+    }
+
+    /** 用一条线路把 [part] 下到文件尾；[start] 是已有字节数，>0 时带 Range 续传。 */
+    private suspend fun streamTo(
+        url: String,
+        part: File,
+        digest: MessageDigest,
+        start: Long,
+        size: Long,
+        onProgress: (done: Long, total: Long) -> Unit
+    ): Attempt {
+        val req = Request.Builder().url(url).header("User-Agent", UA)
+            .apply { if (start > 0) header("Range", "bytes=$start-") }
+            .build()
+        val resp = try {
+            client.newBuilder()
+                .readTimeout(30, TimeUnit.SECONDS)
+                .callTimeout(0, TimeUnit.MILLISECONDS)
+                .build()
+                .newCall(req).execute()
+        } catch (e: Exception) {
+            return Attempt.Failed(e.message ?: "连接失败")
+        }
+
+        resp.use { r ->
+            if (!r.isSuccessful && r.code != 206) {
+                // 416：服务端认为续传位置不合法，丢掉残留从头来
+                if (r.code == 416 && start > 0) {
+                    part.delete()
+                    return Attempt.Failed("续传位置无效，已丢弃残留")
+                }
+                return Attempt.Failed("HTTP ${r.code}")
+            }
+            val body = r.body ?: return Attempt.Failed("下载失败：没有内容")
+            val resuming = start > 0 && r.code == 206
+            if (!resuming) digest.reset() // 线路不支持 Range，整包重下
+            var done = if (resuming) start else 0L
+            val total = body.contentLength().takeIf { it > 0 }?.plus(done) ?: size
+            try {
+                body.byteStream().use { input ->
+                    java.io.FileOutputStream(part, resuming).use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        onProgress(done, total)
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            digest.update(buf, 0, n)
+                            done += n
+                            onProgress(done, total)
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                return Attempt.Partial(e.message ?: "连接中断")
+            }
+        }
+        return Attempt.Done
+    }
+
     // ---------------- 安装 ----------------
 
     fun canInstall(context: Context): Boolean =
         context.packageManager.canRequestPackageInstalls()
 
-    fun install(activity: Activity, file: File) {
-        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
-        activity.startActivity(
-            Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uri, "application/vnd.android.package-archive")
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        )
+    /** 拉起系统安装器。传 Application 也行（下载完自动装的时候就是它），会自动补 NEW_TASK。 */
+    fun install(context: Context, file: File) {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (context !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
     }
 
     /** 少数机型没有直达页面，返回 false 时由界面引导用户手动去开。 */

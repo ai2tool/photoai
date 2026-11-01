@@ -150,9 +150,18 @@ object UpdateManager {
         }
         job = scope.launch {
             try {
+                // 进度回调每 64KB 一次：状态与通知都按 1% 或 500ms 节流，避免上千次重组和通知 IPC
+                var lastNotifyAt = 0L
+                var lastPct = -1
                 val file = AppUpdate.download(app, info) { done, total ->
-                    state = State.Downloading(info, done, total)
-                    notifyProgress(app, info, done, total)
+                    val pct = if (total > 0) (done * 100 / total).toInt() else 0
+                    val now = System.currentTimeMillis()
+                    if (pct != lastPct && now - lastNotifyAt >= 400) {
+                        lastPct = pct
+                        lastNotifyAt = now
+                        state = State.Downloading(info, done, total)
+                        notifyProgress(app, info, done, total)
+                    }
                 }
                 running.set(false)
                 stopService(app)
@@ -196,7 +205,7 @@ object UpdateManager {
             dialogOpen = true
             return
         }
-        runCatching { AppUpdate.install(context as android.app.Activity, file) }
+        runCatching { AppUpdate.install(context, file) }
             .onFailure { e ->
                 state = State.Failed(info, "打开安装器失败：${e.message}", 0)
             }

@@ -1,9 +1,9 @@
 {
-  "versionCode": 4,
-  "versionName": "1.2.1",
-  "url": "https://raw.githubusercontent.com/ai2tool/photoai/main/dist/photoai-1.2.1.apk",
-  "sha256": "3a70af075b724abd8a3eecf6df6c57a4c68d9d0422c33b3731f3da4adadd02ae",
+  "versionCode": 5,
+  "versionName": "1.2.2",
+  "url": "https://raw.githubusercontent.com/ai2tool/photoai/main/dist/photoai-1.2.2.apk",
+  "sha256": "d400013900a9cec4371e52803fe7d05295b4ca60c674ee55368e0023a6edf33a",
   "size": 71577115,
-  "notes": "修复：\n· 部分机型点「直接拍摄」没有反应\n· 换脸时第二张图（自拍/海报）选不上\n\n详见 CHANGELOG.md",
+  "notes": "修复：\n· 部分机型换脸第二张图选不上\n· 下载完成后自动安装闪退\n\n改进：\n· 下载自动走多镜像 + 断点续传增强\n\n详见 CHANGELOG.md",
   "force": false
 }

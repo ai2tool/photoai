@@ -14,6 +14,7 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
 import android.graphics.PointF
 import android.util.Log
+import com.yixiu.photo.BuildConfig
 import com.google.android.gms.tasks.Task
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -390,7 +391,7 @@ object AiEngine {
         val cropT = (srcCy - marginTop).toInt().coerceIn(0, source.height - 1)
         val cropR = (srcCx + marginX).toInt().coerceIn(cropL + 1, source.width)
         val cropB = (srcCy + marginBottom).toInt().coerceIn(cropT + 1, source.height)
-        val patch = Bitmap.createBitmap(source, cropL, cropT, cropR - cropL, cropT.let { cropB - cropT })
+        val patch = Bitmap.createBitmap(source, cropL, cropT, cropR - cropL, cropB - cropT)
 
         val matrix = Matrix().apply {
             // patch 局部坐标 -> 源图坐标 -> 以人脸中心为原点 -> 缩放旋转 -> 贴到目标脸中心
@@ -417,7 +418,9 @@ object AiEngine {
 
         val layer = Bitmap.createBitmap(pw, ph, Bitmap.Config.ARGB_8888)
         val lc = Canvas(layer)
-        android.util.Log.i("YixiuFace", "matrix=$matrix values=${FloatArray(9).also { matrix.getValues(it) }.contentToString()}")
+        if (BuildConfig.DEBUG) {
+            android.util.Log.d("YixiuFace", "faceswap matrix=${FloatArray(9).also { matrix.getValues(it) }.contentToString()}")
+        }
         lc.drawBitmap(patch, matrix, Paint(Paint.FILTER_BITMAP_FLAG).apply {
             colorFilter = ColorMatrixColorFilter(cm)
             isAntiAlias = true

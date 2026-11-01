@@ -361,12 +361,21 @@ private fun FaceSwapPanel(vm: EditorViewModel) {
     var posterUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var sourceUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var msg by rememberSaveable { mutableStateOf<String?>(null) }
+    // 下一次选择归到哪张：0=海报 1=自拍
+    var nextSlot by rememberSaveable { mutableStateOf(0) }
 
-    val posterPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
-        uri?.let { posterUri = it; msg = null }
+    // 整个面板只注册一个选择器：部分机型的相册对同一界面里的第二个选择器会直接返回取消，
+    // 表现为“第二张选不上”。两张图共用它，按 nextSlot 归位。
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
+        if (uri != null) {
+            if (nextSlot == 0) posterUri = uri else sourceUri = uri
+            msg = null
+        }
     }
-    val sourcePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
-        uri?.let { sourceUri = it; msg = null }
+
+    fun launchPick(slot: Int) {
+        nextSlot = slot
+        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
     }
 
     Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
@@ -376,12 +385,8 @@ private fun FaceSwapPanel(vm: EditorViewModel) {
         )
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            GhostButton(if (posterUri == null) "① 选海报" else "① 已选海报") {
-                posterPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-            }
-            GhostButton(if (sourceUri == null) "② 选自拍" else "② 已选自拍") {
-                sourcePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-            }
+            GhostButton(if (posterUri == null) "① 选海报" else "① 已选海报") { launchPick(0) }
+            GhostButton(if (sourceUri == null) "② 选自拍" else "② 已选自拍") { launchPick(1) }
         }
         if (msg != null) {
             Spacer(Modifier.height(8.dp))
@@ -394,6 +399,7 @@ private fun FaceSwapPanel(vm: EditorViewModel) {
                 if (err == null) {
                     posterUri = null
                     sourceUri = null
+                    nextSlot = 0
                 }
             }
         }
