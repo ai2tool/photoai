@@ -1,9 +1,9 @@
 {
-  "versionCode": 6,
-  "versionName": "1.2.3",
-  "url": "https://raw.githubusercontent.com/ai2tool/photoai/main/dist/photoai-1.2.3.apk",
-  "sha256": "866fb9ecc64b9c392fc60ee071d24b36251fd7b0c73ac0d110a3f1b363fd88b6",
-  "size": 71593503,
-  "notes": "修复：\n· 更新弹窗「好」「关闭」按钮被挤成竖条\n· 检查失败显示英文报错，改为中文提示\n· 「下载中断」文案重复显示两遍\n· 检查中关掉弹窗后又被强制弹出\n\n改进：\n· 弹窗排版重做，层次更清晰\n· 进度条加粗，等待时有流动动画\n\n详见 CHANGELOG.md",
+  "versionCode": 7,
+  "versionName": "1.2.4",
+  "url": "https://raw.githubusercontent.com/ai2tool/photoai/main/dist/photoai-1.2.4.apk",
+  "sha256": "801cae457762b85d1fe9c25a53dd081e23cc2faffc5c5a29a4cfd1bb606979cd",
+  "size": 71593499,
+  "notes": "修复：\n· 换脸没融进去——改用双眼对齐、只贴面部皮肤、整脸低频光照匹配\n· 额头不再带入源图碎发\n· 脸边缘不再出现弧形硬边\n\n改进：\n· 更新弹窗排版、按钮、报错文案\n\n详见 CHANGELOG.md",
   "force": false
 }

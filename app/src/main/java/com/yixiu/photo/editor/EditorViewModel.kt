@@ -279,9 +279,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 if (pFaces.isEmpty()) return@launch onDone("海报里没找到人脸")
                 if (sFaces.isEmpty()) return@launch onDone("自拍里没找到人脸")
                 busyLabel = "融合中"
-                val result = withContext(Dispatchers.Default) {
-                    AiEngine.faceswap(poster, source, pFaces.first(), sFaces.first())
-                }
+                val result = AiEngine.faceswap(ctx, poster, source, pFaces.first(), sFaces.first())
                 setBase(result)
                 params = params.copy(bg = BgParams())
                 commitNow()

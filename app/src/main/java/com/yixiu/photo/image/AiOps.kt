@@ -32,6 +32,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 data class FaceInfo(
     val cx: Float,
@@ -41,7 +44,8 @@ data class FaceInfo(
     val roll: Float,
     val leftEye: PointF?,
     val rightEye: PointF?,
-    val mouth: PointF?
+    val mouth: PointF?,
+    val nose: PointF? = null
 ) {
     val left get() = cx - w / 2f
     val top get() = cy - h / 2f
@@ -91,7 +95,8 @@ object AiEngine {
                     roll = f.headEulerAngleZ,
                     leftEye = lm.firstOrNull { it.landmarkType == com.google.mlkit.vision.face.FaceLandmark.LEFT_EYE }?.position,
                     rightEye = lm.firstOrNull { it.landmarkType == com.google.mlkit.vision.face.FaceLandmark.RIGHT_EYE }?.position,
-                    mouth = lm.firstOrNull { it.landmarkType == com.google.mlkit.vision.face.FaceLandmark.MOUTH_BOTTOM }?.position
+                    mouth = lm.firstOrNull { it.landmarkType == com.google.mlkit.vision.face.FaceLandmark.MOUTH_BOTTOM }?.position,
+                    nose = lm.firstOrNull { it.landmarkType == com.google.mlkit.vision.face.FaceLandmark.NOSE_BASE }?.position
                 )
             }.sortedByDescending { it.area }
         }.getOrDefault(emptyList())
@@ -155,6 +160,41 @@ object AiEngine {
             }
             soft
         }
+
+    /**
+     * 「面部皮肤」蒙版，尺寸为分割模型的输出尺寸（约 256 见方），需由调用方按比例换算。
+     * 白色（alpha=255）= 脸（含眉眼唇），透明 = 头发/背景/衣服。
+     * 分割没认出脸时返回 null，调用方退回几何蒙版。
+     */
+    suspend fun faceSkinMask(context: Context, src: Bitmap): Bitmap? = withContext(Dispatchers.Default) {
+        val seg = runCatching { ensureSegmenter(context) }.getOrNull() ?: return@withContext null
+        val input = BitmapUtils.scaleDown(src, 512)
+        val result = runCatching { seg.segment(BitmapImageBuilder(input).build()) }.getOrNull()
+            ?: return@withContext null
+        val catImage = result.categoryMask().orElse(null) ?: return@withContext null
+        val mw = catImage.width
+        val mh = catImage.height
+        val buf = runCatching { ByteBufferExtractor.extract(catImage) }.getOrNull()
+            ?: return@withContext null
+        // 类别：0 背景 / 1 头发 / 2 身体皮肤 / 3 面部皮肤 / 4 衣服 / 5 配饰
+        val px = IntArray(mw * mh)
+        var face = 0
+        for (i in 0 until mw * mh) {
+            val cat = buf.get(i).toInt() and 0xFF
+            val a = if (cat == 3) 255 else 0
+            if (cat == 3) face++
+            px[i] = (a shl 24) or 0x00FFFFFF
+        }
+        // 太小说明没认出脸，太大说明整张图被判成皮肤，都不适合当蒙版
+        if (face < 96 || face > mw * mh * 0.82f) {
+            if (BuildConfig.DEBUG) Log.d("YixiuFace", "skinMask rejected face=$face of ${mw * mh}")
+            return@withContext null
+        }
+        if (BuildConfig.DEBUG) Log.d("YixiuFace", "skinMask ok ${mw}x$mh face=$face")
+        val small = Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888)
+        small.setPixels(px, 0, mw, 0, 0, mw, mh)
+        small
+    }
 
     // ---------------- 美颜 ----------------
 
@@ -368,113 +408,265 @@ object AiEngine {
 
     // ---------------- 换脸：把自拍人脸贴合到海报人脸 ----------------
 
-    fun faceswap(poster: Bitmap, source: Bitmap, targetFace: FaceInfo, srcFace: FaceInfo): Bitmap {
+    /**
+     * 把 [source] 里的人脸换到 [poster] 的 [targetFace] 上。
+     *
+     * 「融不进去」通常来自四件事，这里逐个处理：
+     * 1) 位置和大小：用双眼连线对齐（眼距定缩放、眼角定旋转），比检测框稳得多——
+     *    检测框包含头发、且会随头部角度明显变化，用它算缩放很容易把脸放大或缩小一截；
+     * 2) 范围：用分割模型取「面部皮肤」区域当蒙版，只贴脸，不会把源图的碎发、耳朵、背景一起糊上来；
+     * 3) 颜色：按均值 + 标准差做一次温和的肤色匹配，兜住整体色偏；
+     * 4) 边缘：合成时做低频对齐——把源脸的低频明暗换成目标位置的低频，只保留五官细节（高频），
+     *    再乘一层平滑过渡的软椭圆。椭圆边缘两侧的明暗本来就连着，看不出贴片。
+     */
+    suspend fun faceswap(
+        context: Context,
+        poster: Bitmap,
+        source: Bitmap,
+        targetFace: FaceInfo,
+        srcFace: FaceInfo
+    ): Bitmap = withContext(Dispatchers.Default) {
         val pw = poster.width
         val ph = poster.height
 
-        // 用检测框对齐（海报/插画上关键点不稳），旋转用眼角
-        val srcEyeAngle = srcFace.leftEye?.let { l -> srcFace.rightEye?.let { r -> angle(l, r) } } ?: 0f
-        val tgtEyeAngle = targetFace.leftEye?.let { l -> targetFace.rightEye?.let { r -> angle(l, r) } } ?: targetFace.roll
-        val scale = (targetFace.h / srcFace.h.coerceAtLeast(1f)).coerceIn(0.3f, 3f)
-        val rot = tgtEyeAngle - srcEyeAngle
+        val sL = srcFace.leftEye
+        val sR = srcFace.rightEye
+        val tL = targetFace.leftEye
+        val tR = targetFace.rightEye
+        val useEyes = sL != null && sR != null && tL != null && tR != null
 
-        val srcCx = srcFace.cx
-        val srcCy = srcFace.cy
-        val tgtCx = targetFace.cx
-        val tgtCy = targetFace.cy
+        // 锚点：两眼连线中点；没有关键点时退到检测框中心偏上（大致是眼睛所在高度）
+        val srcAnchor = if (useEyes) mid(sL!!, sR!!) else PointF(srcFace.cx, srcFace.cy - srcFace.h * 0.10f)
+        val tgtAnchor = if (useEyes) mid(tL!!, tR!!) else PointF(targetFace.cx, targetFace.cy - targetFace.h * 0.10f)
+        val srcSpan = if (useEyes) dist(sL!!, sR!!) else srcFace.w * 0.42f
+        val tgtSpan = if (useEyes) dist(tL!!, tR!!) else targetFace.w * 0.42f
+        val scale = (tgtSpan / srcSpan.coerceAtLeast(1f)).coerceIn(0.25f, 3.2f)
+        val rot = (if (useEyes) angle(tL!!, tR!!) else targetFace.roll) -
+            (if (useEyes) angle(sL!!, sR!!) else 0f)
 
-        // 取源图人脸区域
-        val marginX = srcFace.w * 0.62f
-        val marginTop = srcFace.h * 0.72f
-        val marginBottom = srcFace.h * 0.62f
-        val cropL = (srcCx - marginX).toInt().coerceIn(0, source.width - 1)
-        val cropT = (srcCy - marginTop).toInt().coerceIn(0, source.height - 1)
-        val cropR = (srcCx + marginX).toInt().coerceIn(cropL + 1, source.width)
-        val cropB = (srcCy + marginBottom).toInt().coerceIn(cropT + 1, source.height)
+        // 源图裁剪：以眼为中心，往下多留（下巴），往上少留（避开刘海和背景）
+        val cropL = (srcAnchor.x - srcFace.w * 0.80f).toInt().coerceIn(0, source.width - 2)
+        val cropT = (srcAnchor.y - srcFace.h * 0.58f).toInt().coerceIn(0, source.height - 2)
+        val cropR = (srcAnchor.x + srcFace.w * 0.80f).toInt().coerceIn(cropL + 1, source.width)
+        val cropB = (srcAnchor.y + srcFace.h * 0.88f).toInt().coerceIn(cropT + 1, source.height)
         val patch = Bitmap.createBitmap(source, cropL, cropT, cropR - cropL, cropB - cropT)
 
+        // patch 局部坐标 -> 源图坐标 -> 以眼为中心 -> 缩放旋转 -> 目标眼中心
         val matrix = Matrix().apply {
-            // patch 局部坐标 -> 源图坐标 -> 以人脸中心为原点 -> 缩放旋转 -> 贴到目标脸中心
-            postTranslate(cropL - srcCx, cropT - srcCy)
+            postTranslate(cropL - srcAnchor.x, cropT - srcAnchor.y)
             postScale(scale, scale)
             postRotate(rot, 0f, 0f)
-            postTranslate(tgtCx, tgtCy)
+            postTranslate(tgtAnchor.x, tgtAnchor.y)
         }
 
-        // 肤色匹配
-        val srcMean = meanColor(source, srcFace)
-        val tgtMean = meanColor(poster, targetFace)
-        val gains = FloatArray(3) { c ->
-            if (srcMean[c] < 4f) 1f else (tgtMean[c] / srcMean[c]).coerceIn(0.82f, 1.18f)
-        }
-        val cm = ColorMatrix(
-            floatArrayOf(
-                gains[0], 0f, 0f, 0f, 0f,
-                0f, gains[1], 0f, 0f, 0f,
-                0f, 0f, gains[2], 0f, 0f,
-                0f, 0f, 0f, 1f, 0f
-            )
-        )
+        // 融合椭圆：随头部倾斜一起转。故意取得比脸大一圈——真正的边界交给皮肤蒙版（也就是脸的轮廓），
+        // 椭圆只做兜底，免得在脸中间画出一条弧线
+        val ecx = tgtAnchor.x
+        val ecy = tgtAnchor.y + targetFace.h * 0.10f
+        val rx = (targetFace.w * 0.74f).coerceAtLeast(8f)
+        val ry = (targetFace.h * 0.72f).coerceAtLeast(8f)
+        val rollRad = Math.toRadians(-targetFace.roll.toDouble())
 
-        val layer = Bitmap.createBitmap(pw, ph, Bitmap.Config.ARGB_8888)
-        val lc = Canvas(layer)
+        // 只处理椭圆外扩后的矩形：整张海报逐像素跑太浪费
+        val padX = rx * 1.3f
+        val padY = ry * 1.3f
+        val bx = (ecx - padX).toInt().coerceIn(0, pw - 2)
+        val by = (ecy - padY).toInt().coerceIn(0, ph - 2)
+        val bw = (ecx + padX).toInt().coerceIn(bx + 2, pw) - bx
+        val bh = (ecy + padY).toInt().coerceIn(by + 2, ph) - by
+        if (bw < 4 || bh < 4) return@withContext poster.copy(Bitmap.Config.ARGB_8888, true)
+
+        val localMatrix = Matrix(matrix).apply { postTranslate(-bx.toFloat(), -by.toFloat()) }
+
+        // 面部皮肤蒙版：只贴脸。源图两侧的碎发、耳朵、背景不跟着过来，否则脸边上会糊一层发丝。
+        // 分割结果是 256 见方的小图，先裁出 patch 对应的区域再放大，别在整张源图的尺寸上分配内存
+        val skinLayer = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        val skinSmall = runCatching { faceSkinMask(context, source) }.getOrNull()
+        val hasSkin = skinSmall != null
+        if (skinSmall != null) {
+            val kx = skinSmall.width.toFloat() / source.width
+            val ky = skinSmall.height.toFloat() / source.height
+            val ml = (cropL * kx).toInt().coerceIn(0, skinSmall.width - 1)
+            val mt = (cropT * ky).toInt().coerceIn(0, skinSmall.height - 1)
+            val mr = (cropR * kx).toInt().coerceIn(ml + 1, skinSmall.width)
+            val mb = (cropB * ky).toInt().coerceIn(mt + 1, skinSmall.height)
+            val raw = Bitmap.createBitmap(skinSmall, ml, mt, mr - ml, mb - mt)
+            val up = Bitmap.createScaledBitmap(raw, cropR - cropL, cropB - cropT, true)
+            // 蒙版边缘要够宽，否则皮肤边界会变成一条硬边
+            val soften = ((cropR - cropL) * 0.14f).toInt().coerceIn(1, 96)
+            val softPatch = ImageOps.blur(up, soften, 2)
+            Canvas(skinLayer).drawBitmap(softPatch, localMatrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        }
+        val skinPx = skinLayer.pixels()
         if (BuildConfig.DEBUG) {
-            android.util.Log.d("YixiuFace", "faceswap matrix=${FloatArray(9).also { matrix.getValues(it) }.contentToString()}")
+            Log.d("YixiuFace", "faceswap hasSkin=$hasSkin skin=${skinSmall?.width}x${skinSmall?.height} scale=$scale rot=$rot box=${bw}x$bh")
         }
-        lc.drawBitmap(patch, matrix, Paint(Paint.FILTER_BITMAP_FLAG).apply {
-            colorFilter = ColorMatrixColorFilter(cm)
-            isAntiAlias = true
-        })
 
-        // 紧贴目标脸的椭圆羽化蒙版
-        val mask = Bitmap.createBitmap(pw, ph, Bitmap.Config.ARGB_8888)
-        val mc = Canvas(mask)
-        val ecx = tgtCx
-        val ecy = tgtCy + targetFace.h * 0.04f
-        val rx = targetFace.w * 0.56f
-        val ry = targetFace.h * 0.62f
-        val mp = Paint().apply {
-            color = Color.WHITE
+        // 肤色匹配：均值 + 标准差，只做温和修正，剩下的交给低频对齐
+        val srcStat = skinStats(patch, srcAnchor.x - cropL, srcAnchor.y - cropT, (cropR - cropL) * 0.34f, (cropB - cropT) * 0.30f)
+        val tgtStat = skinStats(poster, tgtAnchor.x, tgtAnchor.y, targetFace.w * 0.34f, targetFace.h * 0.30f)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(skinMatrix(srcStat, tgtStat))
             isAntiAlias = true
-            maskFilter = BlurMaskFilter(maxOf(rx, ry) * 0.13f, BlurMaskFilter.Blur.NORMAL)
+            isFilterBitmap = true
         }
-        mc.save()
-        mc.rotate(targetFace.roll, ecx, ecy)
-        mc.drawOval(RectF(ecx - rx, ecy - ry, ecx + rx, ecy + ry * 0.98f), mp)
-        mc.restore()
 
-        lc.drawBitmap(mask, 0f, 0f, Paint().apply {
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
-        })
+        // 低频半径按目标尺度算，源图那侧按 scale 折算，保证两边频率一致。
+        // 半径要够大才能把目标的光照（侧光、阴影）抓进低频，否则脸会显得又平又亮
+        val radiusTgt = (maxOf(rx, ry) * 0.26f).toInt().coerceIn(4, 140)
+        val radiusSrc = (radiusTgt / scale).toInt().coerceIn(1, 140)
+        val lowPatch = ImageOps.blur(patch, radiusSrc, 2)
 
-        val out = poster.copy(Bitmap.Config.ARGB_8888, true)
-        Canvas(out).drawBitmap(layer, 0f, 0f, null)
-        return out
+        val layer = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        Canvas(layer).drawBitmap(patch, localMatrix, paint)
+        val lowLayer = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        Canvas(lowLayer).drawBitmap(lowPatch, localMatrix, paint)
+
+        val posterRegion = Bitmap.createBitmap(poster, bx, by, bw, bh)
+        val posterLow = ImageOps.blur(posterRegion, radiusTgt, 2)
+
+        val base = posterRegion.pixels()
+        val src = layer.pixels()
+        val srcLow = lowLayer.pixels()
+        val dstLow = posterLow.pixels()
+        val out = base.copyOf()
+
+        // 融合蒙版：整张脸（避开额头）+ 皮肤轮廓。
+        // 只换五官会变成一块块"补丁"，因为源图的皮肤纹理和目标不连续；整脸换过去再靠低频对齐
+        // 把明暗接上，过渡反而更整。额头那一段单独淡出——源图脸上的碎发会跟着过来，而半透明
+        // 的细发丝跟皮肤亮度几乎一样，没法靠判据区分，索性让额头保持目标原样。
+        fun ellipseAlpha(px: Float, py: Float): Float {
+            val ox = px - ecx
+            val oy = py - ecy
+            val nx = (ox * cos(rollRad) - oy * sin(rollRad)) / rx
+            val ny = (ox * sin(rollRad) + oy * cos(rollRad)) / ry
+            val d = sqrt((nx * nx + ny * ny).toDouble()).toFloat()
+            if (d >= 1f) return 0f
+            val t = ((1f - d) / 0.30f).coerceIn(0f, 1f)
+            return t * t * (3f - 2f * t)
+        }
+
+        parallelFor(bh) { y ->
+            val gy = y + by
+            for (x in 0 until bw) {
+                val i = y * bw + x
+                val s = src[i]
+                val sa = (s ushr 24) and 0xFF
+                if (sa < 6) continue // patch 没覆盖到这里
+
+                // 皮肤蒙版：低于一半的一律不贴——半透明叠加会把源图的碎发变成一层重影糊在脸上
+                val skinRaw = if (hasSkin) (((skinPx[i] ushr 24) and 0xFF) / 255f) else 1f
+                if (skinRaw < 0.42f) continue
+                val skinW = ((skinRaw - 0.42f) / 0.58f).coerceIn(0f, 1f)
+
+                val ell = ellipseAlpha((x + bx).toFloat(), gy.toFloat())
+                if (ell < 0.02f) continue
+
+                // 眼睛以上（额头）淡出到 0，碎发最密的地方直接保留目标原样
+                val relY = if (targetFace.h > 1f) (gy - tgtAnchor.y) / targetFace.h else 0f
+                val topFade = ((relY + 0.28f) / 0.14f).coerceIn(0f, 1f)
+
+                // 低频对齐：源高频 + 目标低频（半透明边缘不参与，避免模糊把边缘拉暗）
+                val low = if (sa >= 250) srcLow[i] else s
+
+                val a = ell * skinW * topFade
+
+                val b = base[i]
+                // 源的高频只取八成：五官细节还在，但不会盖掉目标图的皮肤质感和光斑，减少"塑料脸"
+                val adjR = ((dstLow[i] shr 16) and 0xFF) + (((s shr 16) and 0xFF) - ((low shr 16) and 0xFF)) * 0.82f
+                val adjG = ((dstLow[i] shr 8) and 0xFF) + (((s shr 8) and 0xFF) - ((low shr 8) and 0xFF)) * 0.82f
+                val adjB = (dstLow[i] and 0xFF) + ((s and 0xFF) - (low and 0xFF)) * 0.82f
+
+                val r = mixChannel((b shr 16) and 0xFF, adjR, a) shl 16
+                val g = mixChannel((b shr 8) and 0xFF, adjG, a) shl 8
+                val bl = mixChannel(b and 0xFF, adjB, a)
+                out[i] = (0xFF shl 24) or r or g or bl
+            }
+        }
+
+        val out2 = poster.copy(Bitmap.Config.ARGB_8888, true)
+        Canvas(out2).drawBitmap(out.toBitmap(bw, bh), bx.toFloat(), by.toFloat(), null)
+        out2
+    }
+
+    private fun mixChannel(dst: Int, src: Float, a: Float): Int {
+        val v = dst * (1f - a) + src.coerceIn(0f, 255f) * a
+        return if (v <= 0f) 0 else if (v >= 255f) 255 else v.toInt()
     }
 
     private fun angle(l: PointF, r: PointF) =
         Math.toDegrees(Math.atan2((r.y - l.y).toDouble(), (r.x - l.x).toDouble())).toFloat()
 
-    private fun meanColor(bmp: Bitmap, face: FaceInfo): FloatArray {
-        val cx = face.cx.toInt().coerceIn(0, bmp.width - 1)
-        val cy = face.cy.toInt().coerceIn(0, bmp.height - 1)
-        val hw = (face.w * 0.28f).toInt().coerceAtLeast(2)
-        val hh = (face.h * 0.28f).toInt().coerceAtLeast(2)
-        val x0 = (cx - hw).coerceAtLeast(0)
-        val y0 = (cy - hh).coerceAtLeast(0)
-        val x1 = (cx + hw).coerceAtMost(bmp.width)
-        val y1 = (cy + hh).coerceAtMost(bmp.height)
-        if (x1 <= x0 || y1 <= y0) return floatArrayOf(128f, 128f, 128f)
-        val region = Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
-        val px = region.pixels()
-        var r = 0L; var g = 0L; var b = 0L
-        for (p in px) {
-            r += (p shr 16) and 0xFF; g += (p shr 8) and 0xFF; b += p and 0xFF
-        }
-        val n = px.size.coerceAtLeast(1)
-        return floatArrayOf(r.toFloat() / n, g.toFloat() / n, b.toFloat() / n)
+    private fun mid(l: PointF, r: PointF) = PointF((l.x + r.x) / 2f, (l.y + r.y) / 2f)
+
+    private fun dist(l: PointF, r: PointF): Float {
+        val dx = r.x - l.x
+        val dy = r.y - l.y
+        return sqrt((dx * dx + dy * dy).toDouble()).toFloat()
     }
 
+    /**
+     * 脸部皮肤区的均值与标准差：`[r, g, b, stdR, stdG, stdB]`。
+     * 只取椭圆中心 85% 范围，避开头发、背景和边缘过渡。
+     */
+    private fun skinStats(bmp: Bitmap, cx: Float, cy: Float, rx: Float, ry: Float): FloatArray {
+        val ww = (rx * 2f).toInt().coerceAtLeast(2)
+        val hh = (ry * 2f).toInt().coerceAtLeast(2)
+        val x0 = (cx - rx).toInt().coerceIn(0, (bmp.width - ww).coerceAtLeast(0))
+        val y0 = (cy - ry).toInt().coerceIn(0, (bmp.height - hh).coerceAtLeast(0))
+        val w = ww.coerceAtMost(bmp.width - x0).coerceAtLeast(1)
+        val h = hh.coerceAtMost(bmp.height - y0).coerceAtLeast(1)
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, x0, y0, w, h)
+
+        var n = 0
+        var sr = 0.0
+        var sg = 0.0
+        var sb = 0.0
+        var qr = 0.0
+        var qg = 0.0
+        var qb = 0.0
+        val hx = w / 2f
+        val hy = h / 2f
+        for (y in 0 until h) {
+            val ny = (y - hy) / hy
+            for (x in 0 until w) {
+                val nx = (x - hx) / hx
+                if (nx * nx + ny * ny > 0.85f) continue
+                val p = px[y * w + x]
+                val r = ((p shr 16) and 0xFF).toDouble()
+                val g = ((p shr 8) and 0xFF).toDouble()
+                val b = (p and 0xFF).toDouble()
+                sr += r; sg += g; sb += b
+                qr += r * r; qg += g * g; qb += b * b
+                n++
+            }
+        }
+        if (n < 16) return floatArrayOf(128f, 128f, 128f, 40f, 40f, 40f)
+        val mr = sr / n; val mg = sg / n; val mb = sb / n
+        fun sd(q: Double, m: Double) = sqrt((q / n - m * m).coerceAtLeast(1.0)).toFloat()
+        return floatArrayOf(mr.toFloat(), mg.toFloat(), mb.toFloat(), sd(qr, mr), sd(qg, mg), sd(qb, mb))
+    }
+
+    /** 按均值/标准差把源肤色温和地掰向目标肤色；幅度收着点，避免把五官染色。 */
+    private fun skinMatrix(src: FloatArray, tgt: FloatArray): ColorMatrix {
+        val gain = FloatArray(3) { c ->
+            val s = src[c + 3].coerceAtLeast(4f)
+            val t = tgt[c + 3].coerceAtLeast(4f)
+            (1f + (t / s - 1f) * 0.55f).coerceIn(0.86f, 1.16f)
+        }
+        val offset = FloatArray(3) { c ->
+            ((tgt[c] - gain[c] * src[c]) * 0.55f).coerceIn(-40f, 40f)
+        }
+        return ColorMatrix(
+            floatArrayOf(
+                gain[0], 0f, 0f, 0f, offset[0],
+                0f, gain[1], 0f, 0f, offset[1],
+                0f, 0f, gain[2], 0f, offset[2],
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+    }
     // ---------------- 背景替换 ----------------
 
     fun compositeBackground(
