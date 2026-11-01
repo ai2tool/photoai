@@ -58,10 +58,10 @@ git add -A && git commit -m "Release v<版本>" && git tag v<版本> && git push
 
 ## 安装
 
-直接安装 `dist/photoai-1.2.2.apk`（约 68MB，已签名）：
+直接安装 `dist/photoai-1.2.3.apk`（约 68MB，已签名）：
 
 ```bash
-adb install dist/photoai-1.2.2.apk
+adb install dist/photoai-1.2.3.apk
 ```
 
 要求 Android 8.0（API 26）及以上，arm64 / armv7 设备或模拟器。

@@ -158,7 +158,17 @@ object AppUpdate {
                 }
             }
     } catch (e: Exception) {
-        null to (e.message ?: e.javaClass.simpleName)
+        null to reason(e)
+    }
+
+    /** 底层网络异常翻成用户看得懂的话；弹窗里直接显示，别再抛英文栈信息给人看。 */
+    private fun reason(e: Throwable): String = when (e) {
+        is java.net.UnknownHostException -> "连不上服务器，域名解析失败"
+        is java.net.SocketTimeoutException -> "连接超时，换个网络试试"
+        is java.net.ConnectException -> "服务器拒绝连接"
+        is javax.net.ssl.SSLException -> "安全连接失败，稍后再试"
+        is java.io.IOException -> "网络中断"
+        else -> "网络异常（${e.javaClass.simpleName}）"
     }
 
     // ---------------- 下载 ----------------
@@ -253,8 +263,9 @@ object AppUpdate {
         }
         if (!completed) {
             val saved = part.length()
+            // 已保存的字节数由弹窗单独展示，这里只说原因，避免同一句话出现两遍
             throw IllegalStateException(
-                if (saved > 0) "下载中断，已保存 ${saved / 1024 / 1024}MB，下次继续（${lastError ?: "所有线路都不通"}）"
+                if (saved > 0) "网络不稳定，没有下完（${lastError ?: "所有线路都不通"}）"
                 else "下载失败（${lastError ?: "所有线路都连不上"}）"
             )
         }
@@ -305,7 +316,7 @@ object AppUpdate {
                 .build()
                 .newCall(req).execute()
         } catch (e: Exception) {
-            return Attempt.Failed(e.message ?: "连接失败")
+            return Attempt.Failed(reason(e))
         }
 
         resp.use { r ->
@@ -341,7 +352,7 @@ object AppUpdate {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                return Attempt.Partial(e.message ?: "连接中断")
+                return Attempt.Partial(reason(e))
             }
         }
         return Attempt.Done

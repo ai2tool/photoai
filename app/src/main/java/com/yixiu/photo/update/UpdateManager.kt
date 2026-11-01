@@ -65,6 +65,9 @@ object UpdateManager {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var job: Job? = null
     private var checkedOnLaunch = AtomicBoolean(false)
+
+    /** 本次检查期间用户把弹窗关掉了：结果出来时不要再弹一次。 */
+    private var closedWhileChecking = false
     private val running = AtomicBoolean(false)
 
     val currentVersion: String get() = BuildConfig.VERSION_NAME
@@ -83,6 +86,7 @@ object UpdateManager {
         if (running.get()) return
         this.manual = manual
         if (manual) {
+            closedWhileChecking = false
             state = State.Checking
             dialogOpen = true
         }
@@ -97,7 +101,8 @@ object UpdateManager {
                 }
                 else -> {
                     state = State.Available(r.info)
-                    dialogOpen = true
+                    // 用户检查到一半就把弹窗关了，就别再强行弹一次；首页那一行仍然会提示有新版本
+                    dialogOpen = !(manual && closedWhileChecking)
                 }
             }
         }
@@ -114,6 +119,7 @@ object UpdateManager {
     fun dismiss() {
         tip = null
         dialogOpen = false
+        if (state is State.Checking) closedWhileChecking = true
         if (state is State.UpToDate) state = State.Idle
         if (state is State.Failed) {
             state = (state as State.Failed).info?.let { State.Available(it) } ?: State.Idle
@@ -179,7 +185,10 @@ object UpdateManager {
                 running.set(false)
                 stopService(app)
                 notifyCancel(app)
-                state = State.Failed(info, e.message ?: "下载失败", AppUpdate.partialBytes(app, info))
+                // AppUpdate 抛的 IllegalStateException 带的是中文原因，其它异常只报类型，别把英文栈信息甩给用户
+                val msg = e.message?.takeIf { e is IllegalStateException && it.isNotBlank() }
+                    ?: "下载失败（${e.javaClass.simpleName}）"
+                state = State.Failed(info, msg, AppUpdate.partialBytes(app, info))
             }
         }
     }
