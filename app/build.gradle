@@ -13,11 +13,16 @@ android {
         applicationId "com.yixiu.photo"
         minSdk 26
         targetSdk 35
-    // CI 发版时用 -PversionName=1.2 -PversionCode=<n> 覆盖
-    def propVersionCode = project.findProperty('versionCode')
-    def propVersionName = project.findProperty('versionName')
-    versionCode propVersionCode == null ? 3 : propVersionCode.toString().toInteger()
-    versionName propVersionName == null ? "1.2" : propVersionName.toString()
+    // 版本号唯一来源：根目录 version.properties；发版可用 -PversionName/-PversionCode 临时覆盖
+    def versionProps = new Properties()
+    def versionFile = rootProject.file('version.properties')
+    if (versionFile.exists()) {
+        versionFile.withInputStream { versionProps.load(it) }
+    }
+    def propVersionCode = project.findProperty('versionCode') ?: versionProps.getProperty('versionCode', '4')
+    def propVersionName = project.findProperty('versionName') ?: versionProps.getProperty('versionName', '1.2.1')
+    versionCode propVersionCode.toString().toInteger()
+    versionName propVersionName.toString()
         // 自动更新清单地址（不含文件名）。用 -PupdateBase=... 可指向自建/测试服务器
         buildConfigField "String", "UPDATE_BASE", "\"${project.findProperty('updateBase') ?: 'https://raw.githubusercontent.com/ai2tool/photoai/main/update'}\""
         ndk {

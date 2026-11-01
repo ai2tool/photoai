@@ -13,3 +13,7 @@ local.properties
 # CI 临时
 *.keystore
 !debug.keystore
+
+# 构建产物（APK 走 release 附件，不入库）
+*.apk
+*.aab
