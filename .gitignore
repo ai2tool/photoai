@@ -10,10 +10,12 @@ local.properties
 *.iml
 .DS_Store
 
-# CI 临时
+# 密钥一律不入库
 *.keystore
-!debug.keystore
+*.jks
+*.p12
 
-# 构建产物（APK 走 release 附件，不入库）
+# APK 只保留 dist/ 下的发布包
 *.apk
 *.aab
+!dist/*.apk

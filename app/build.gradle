@@ -30,8 +30,8 @@ android {
         }
     }
 
-    // 本机默认用 debug.keystore，保证「上一版能收到下一版的更新」（同签名才可覆盖安装）。
-    // CI 通过环境变量 KEYSTORE_PATH 提供固定的发布 keystore，跨版本签名一致。
+    // 签名只在本机进行：默认用 ~/.android/debug.keystore，
+    // 需要时用 KEYSTORE_PATH / KEYSTORE_PASSWORD / KEYSTORE_ALIAS / KEY_PASSWORD 环境变量换成自己的发布密钥。
     def localDebugKeystore = file(System.getProperty("user.home") + "/.android/debug.keystore")
     def ciKeystorePath = System.getenv("KEYSTORE_PATH")
     signingConfigs {

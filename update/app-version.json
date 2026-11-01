@@ -1,9 +1,9 @@
 {
   "versionCode": 4,
   "versionName": "1.2.1",
-  "url": "https://github.com/ai2tool/photoai/releases/download/v1.2.1/photoai-1.2.1.apk",
-  "sha256": "",
-  "size": 0,
-  "notes": "修复：\n· 部分机型点「直接拍摄」没有反应\n· 换脸时第二张图片（自拍/海报）选不上\n\n版本号统一由 version.properties 管理，避免 versionCode 回退导致收不到更新",
+  "url": "https://raw.githubusercontent.com/ai2tool/photoai/main/dist/photoai-1.2.1.apk",
+  "sha256": "3a70af075b724abd8a3eecf6df6c57a4c68d9d0422c33b3731f3da4adadd02ae",
+  "size": 71577115,
+  "notes": "修复：\n· 部分机型点「直接拍摄」没有反应\n· 换脸时第二张图（自拍/海报）选不上\n\n详见 CHANGELOG.md",
   "force": false
 }

@@ -32,29 +32,36 @@
 
 ### 发版流程
 
+全本地完成，不需要 CI、不需要上传密钥：
+
 ```bash
-# 1. 改 versionCode/versionName（或让 CI 从 git 提交数/tag 推导）
-# 2. 打 tag 推送，GitHub Actions 自动构建、发布 Release 并更新清单
-git tag v1.2 && git push origin v1.2
+# 1. 改 version.properties 的 versionName / versionCode（versionCode 必须比上一个大）
+# 2. 在 CHANGELOG.md 顶部写这一版改了什么
+# 3. 打包并放进 dist/
+./gradlew assembleRelease
+cp app/build/outputs/apk/release/app-release.apk dist/photoai-<版本>.apk
+
+# 4. 生成更新清单（自动写入地址、SHA-256、体积），再把 notes 改成 CHANGELOG 里的摘要
+./scripts/publish-update.sh <版本> <versionCode> \
+  https://raw.githubusercontent.com/ai2tool/photoai/main/dist/photoai-<版本>.apk \
+  dist/photoai-<版本>.apk
+
+# 5. 提交推送（可选打个 tag 做标记）
+git add -A && git commit -m "Release v<版本>" && git tag v<版本> && git push origin main --tags
 ```
 
-CI 需要 4 个仓库 Secret，保证各版本签名一致（否则已装用户无法覆盖安装）：
+签名用本机 `~/.android/debug.keystore`，跨版本保持一致，所以老用户能直接覆盖升级；要换密钥就设置 `KEYSTORE_PATH` / `KEYSTORE_PASSWORD` / `KEYSTORE_ALIAS` / `KEY_PASSWORD` 环境变量再打包（换密钥后老版本需卸载重装）。
 
-| Secret | 说明 |
-|---|---|
-| `SIGNING_KEYSTORE_B64` | 发布 keystore 的 base64 |
-| `SIGNING_STORE_PASSWORD` / `SIGNING_KEY_ALIAS` / `SIGNING_KEY_PASSWORD` | 对应口令与别名 |
-
-也可以本地发布：`./scripts/publish-update.sh <版本名> <版本号> <APK下载地址> [APK文件]` 生成清单后提交推送。
+历史版本见 [CHANGELOG.md](CHANGELOG.md)，安装包见 [`dist/`](dist/)。
 
 测试更新流程可指向任意 HTTP 源：`./gradlew assembleDebug -PupdateBase=http://10.0.2.2:8000`。
 
 ## 安装
 
-直接安装 `app/build/outputs/apk/release/app-release.apk`（约 68MB，已签名）：
+直接安装 `dist/photoai-1.2.1.apk`（约 68MB，已签名）：
 
 ```bash
-adb install app/build/outputs/apk/release/app-release.apk
+adb install dist/photoai-1.2.1.apk
 ```
 
 要求 Android 8.0（API 26）及以上，arm64 / armv7 设备或模拟器。
@@ -93,6 +100,10 @@ app/src/main/java/com/yixiu/photo/
     ├── Panels.kt              # 各工具面板（滑杆/滤镜/抠图/换脸…）
     ├── CropDialog.kt          # 裁剪全屏对话框
     └── Theme.kt               # 暗色主题
+dist/                       # 发布用 APK（由本地打包拷入）
+update/app-version.json     # 自动更新清单（地址 / SHA-256 / 体积 / 更新说明）
+version.properties          # 版本号唯一来源
+CHANGELOG.md                # 各版本更新日志
 ```
 
 ## 性能说明
