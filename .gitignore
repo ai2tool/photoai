@@ -1,0 +1,15 @@
+# Build
+.gradle/
+build/
+app/build/
+.kotlin/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# CI 临时
+*.keystore
+!debug.keystore

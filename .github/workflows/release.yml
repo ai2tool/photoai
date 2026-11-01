@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建不发布"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Prepare signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=${{ secrets.SIGNING_STORE_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "KEYSTORE_ALIAS=${{ secrets.SIGNING_KEY_ALIAS }}" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${{ secrets.SIGNING_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ 未配置 SIGNING_KEYSTORE_B64 等密钥，改用 runner 生成的临时 keystore。"
+            echo "   这样打出的包无法作为已装应用的更新安装！仅用于测试构建。"
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android \
+              -keypass android -alias androiddebugkey -keyalg RSA -validity 10000 \
+              -dname "CN=Yixiu Debug,O=Yixiu,C=CN"
+          fi
+
+      - name: Build release APK
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          CODE=$(git rev-list --count HEAD)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER=$(grep -o '"versionName": *"[^"]*"' update/app-version.json | cut -d'"' -f4)
+            CODE=$(grep -o '"versionCode": *[0-9]*' update/app-version.json | grep -o '[0-9]*')
+          fi
+          ./gradlew assembleRelease -PversionName="$VER" -PversionCode="$CODE" --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk "photoai-$VER.apk"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "CODE=$CODE" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: photoai-apk
+          path: photoai-*.apk
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: photoai-*.apk
+          generate_release_notes: true
+
+      - name: Publish update manifest
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "⚠️ 无发布签名密钥，跳过清单发布（临时签名的包不能发给已装用户）。"
+            exit 0
+          fi
+          SHA=$(shasum -a 256 "photoai-$VER.apk" | awk '{print $1}')
+          SIZE=$(stat -c%s "photoai-$VER.apk")
+          python3 - "$VER" "$CODE" "$SHA" "$SIZE" <<'PY'
+          import json, sys
+          ver, code, sha, size = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+          p = "update/app-version.json"
+          m = json.load(open(p, encoding="utf-8"))
+          m.update({
+              "versionCode": code, "versionName": ver,
+              "url": f"https://github.com/ai2tool/photoai/releases/download/v{ver}/photoai-{ver}.apk",
+              "sha256": sha, "size": size, "force": False,
+          })
+          json.dump(m, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          print(open(p, encoding="utf-8").read())
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update/app-version.json
+          if git diff --cached --quiet; then
+            echo "清单无变化"
+          else
+            git commit -m "Release v$VER"
+            git push
+          fi
